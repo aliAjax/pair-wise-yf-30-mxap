@@ -18,11 +18,21 @@ python3 app.py --db pharmacovigilance.db
 
 - `POST /api/cases`：录入案例，`dedupe_key` 相同则返回已存在案例。
 - `GET /api/cases`、`GET /api/cases/{id}`：按权限查询。
+- `POST /api/cases/{id}/sources`：来源补录，记入首次知情台账；最早的来源知情时间成为监管时限基准。同一来源重复补录只让最早时间生效，另一条作为重复来源挂在案例上；越权补录返回 403。
 - `POST /api/cases/{id}/followups`：用 `expected_revision` 防止覆盖随访。
-- `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性。
+- `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性；对来源变动后待更正的报告做重新确认。
 - `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
+
+## 首次知情台账
+
+监管时限从案例的**首次知情时间**（`first_knowledge_at`）起算，即所有来源（首次录入与各次补录）中最早的来源知情时间。
+
+- 补录来源后，未提交报告的期限立刻按新基准重算，逾期列表同步更新。
+- 已提交报告保留原提交记录（`submitted_at`、`late` 及 `original_*` 字段）并转为 `pending_correction`（待更正）；医学审核员重新确认后才能重报。
+- 两人同时补录同一来源时，最早时间生效，另一条记为重复来源（`is_duplicate=1`）。
+- 升级后旧数据按首次收到时间回填来源台账与基准，原记录仍可查询。
 
 ## 测试
 
