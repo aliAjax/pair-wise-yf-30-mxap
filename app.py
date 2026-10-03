@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
+# 未最终提交、期限随时限基准重算的报告状态
+OPEN_REPORT_STATUSES = ("pending", "overdue", "correction_required")
 
 
 class ApiError(Exception):
@@ -48,10 +50,19 @@ def parse_time(value: str | None, default: datetime | None = None) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
+def report_deadline(clock_start: datetime, serious: bool, fatal: bool) -> datetime:
     if serious:
-        return received_at + timedelta(days=7 if fatal else 15)
-    return received_at + timedelta(days=90)
+        return clock_start + timedelta(days=7 if fatal else 15)
+    return clock_start + timedelta(days=90)
+
+
+def source_times(body: dict[str, Any]) -> tuple[datetime, datetime]:
+    """每次接入都记录收到时间和来源知情时间，知情时间不得晚于收到时间。"""
+    received = parse_time(body.get("received_at"), utcnow())
+    aware = parse_time(body.get("aware_at"), received)
+    if aware > received:
+        raise ApiError(400, "invalid_awareness_time", "来源知情时间不能晚于收到时间")
+    return received, aware
 
 
 class Repository:
@@ -62,6 +73,7 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.init_schema()
+        self.migrate()
 
     @contextmanager
     def tx(self):
@@ -85,6 +97,7 @@ class Repository:
                 event_term TEXT NOT NULL,
                 onset_at TEXT,
                 received_at TEXT NOT NULL,
+                clock_start_at TEXT,
                 serious INTEGER NOT NULL DEFAULT 0,
                 fatal INTEGER NOT NULL DEFAULT 0,
                 causality TEXT,
@@ -103,6 +116,8 @@ class Repository:
                 dedupe_key TEXT NOT NULL UNIQUE,
                 payload_json TEXT NOT NULL,
                 received_at TEXT NOT NULL,
+                aware_at TEXT,
+                kind TEXT NOT NULL DEFAULT 'initial',
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -112,6 +127,7 @@ class Repository:
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
                 received_at TEXT NOT NULL,
+                aware_at TEXT,
                 revision INTEGER NOT NULL,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -126,6 +142,8 @@ class Repository:
                 submitted_at TEXT,
                 submitted_by TEXT,
                 late INTEGER NOT NULL DEFAULT 0,
+                confirmed_by TEXT,
+                confirmed_at TEXT,
                 UNIQUE(case_id, country)
             );
             CREATE TABLE IF NOT EXISTS medical_reviews (
@@ -151,6 +169,60 @@ class Repository:
             );
             """
         )
+
+    def migrate(self) -> None:
+        """旧库升级：补齐首次知情台账列，缺来源时间的按首次收到时间回填。只增不改，原记录仍可查。"""
+        changes: list[str] = []
+        intake_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(intakes)")}
+        if "aware_at" not in intake_cols:
+            self.conn.execute("ALTER TABLE intakes ADD COLUMN aware_at TEXT")
+            self.conn.execute("UPDATE intakes SET aware_at=received_at WHERE aware_at IS NULL")
+            changes.append("intakes.aware_at")
+        if "kind" not in intake_cols:
+            self.conn.execute("ALTER TABLE intakes ADD COLUMN kind TEXT NOT NULL DEFAULT 'initial'")
+            changes.append("intakes.kind")
+        followup_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(followups)")}
+        if "aware_at" not in followup_cols:
+            self.conn.execute("ALTER TABLE followups ADD COLUMN aware_at TEXT")
+            self.conn.execute("UPDATE followups SET aware_at=received_at WHERE aware_at IS NULL")
+            changes.append("followups.aware_at")
+        case_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(cases)")}
+        if "clock_start_at" not in case_cols:
+            self.conn.execute("ALTER TABLE cases ADD COLUMN clock_start_at TEXT")
+            self.conn.execute("UPDATE cases SET clock_start_at=received_at WHERE clock_start_at IS NULL")
+            for table in ("intakes", "followups"):
+                self.conn.execute(
+                    f"""UPDATE cases SET clock_start_at=(
+                            SELECT MIN(s.aware_at) FROM {table} s
+                            WHERE s.case_id=cases.id AND s.aware_at IS NOT NULL)
+                        WHERE EXISTS(
+                            SELECT 1 FROM {table} s
+                            WHERE s.case_id=cases.id AND s.aware_at IS NOT NULL
+                              AND s.aware_at < cases.clock_start_at)"""
+                )
+            changes.append("cases.clock_start_at")
+            changes.extend(self._recompute_deadlines_after_backfill())
+        report_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(reports)")}
+        if "confirmed_by" not in report_cols:
+            self.conn.execute("ALTER TABLE reports ADD COLUMN confirmed_by TEXT")
+            self.conn.execute("ALTER TABLE reports ADD COLUMN confirmed_at TEXT")
+            changes.append("reports.confirmation")
+        if changes:
+            Repository.audit(self.conn, None, "system", "global_admin", "schema_migrated", {"changes": changes})
+
+    def _recompute_deadlines_after_backfill(self) -> list[str]:
+        """回填时限基准后，未提交报告的期限立刻按首次知情重算；已提交报告保持原记录不动。"""
+        recomputed = []
+        for case in self.conn.execute("SELECT * FROM cases").fetchall():
+            due = iso(report_deadline(parse_time(case["clock_start_at"]), bool(case["serious"]), bool(case["fatal"])))
+            if due != case["report_due_at"]:
+                self.conn.execute("UPDATE cases SET report_due_at=? WHERE id=?", (due, case["id"]))
+                recomputed.append(f"case:{case['id']}")
+            self.conn.execute(
+                "UPDATE reports SET due_at=? WHERE case_id=? AND status IN ('pending','overdue') AND due_at!=?",
+                (due, case["id"], due),
+            )
+        return recomputed
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -189,6 +261,61 @@ class PharmacovigilanceService:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
 
+    # ---- 首次知情台账 ----
+
+    def _clock_start(self, conn: sqlite3.Connection, case_id: int) -> datetime | None:
+        """时限基准 = 该案例全部来源接入中最早的知情时间。"""
+        rows = conn.execute(
+            """SELECT aware_at FROM intakes WHERE case_id=? AND aware_at IS NOT NULL
+               UNION ALL SELECT aware_at FROM followups WHERE case_id=? AND aware_at IS NOT NULL""",
+            (case_id, case_id),
+        ).fetchall()
+        if not rows:
+            return None
+        return min(parse_time(row[0]) for row in rows)
+
+    def _sync_report_deadlines(self, conn: sqlite3.Connection, case: dict[str, Any], actor: str, role: str,
+                               reason: str, correct_submitted: bool) -> None:
+        """按首次知情基准重算国家报告期限；已提交报告转成待更正并保留原提交记录。"""
+        due = iso(report_deadline(parse_time(case["clock_start_at"] or case["received_at"]),
+                               bool(case["serious"]), bool(case["fatal"])))
+        reports = conn.execute("SELECT * FROM reports WHERE case_id=?", (case["id"],)).fetchall()
+        for report in reports:
+            if report["status"] == "submitted":
+                if not correct_submitted:
+                    continue
+                conn.execute("UPDATE reports SET status='correction_required',due_at=? WHERE id=?", (due, report["id"]))
+                Repository.audit(conn, case["id"], actor, role, "report_correction_required", {
+                    "report_id": report["id"], "country": report["country"], "reason": reason, "new_due_at": due,
+                    "original_submission": {
+                        "submitted_at": report["submitted_at"], "submitted_by": report["submitted_by"],
+                        "late": bool(report["late"]), "due_at": report["due_at"],
+                    }})
+            elif report["status"] in OPEN_REPORT_STATUSES and report["due_at"] != due:
+                conn.execute("UPDATE reports SET due_at=? WHERE id=?", (due, report["id"]))
+                Repository.audit(conn, case["id"], actor, role, "report_deadline_recomputed", {
+                    "report_id": report["id"], "country": report["country"], "reason": reason,
+                    "previous_due_at": report["due_at"], "new_due_at": due})
+
+    def _refresh_clock(self, conn: sqlite3.Connection, case_id: int, actor: str, role: str, reason: str) -> bool:
+        """最早来源知情时间提前时重算时限基准并联动国家报告；基准只会提前，不会推后。"""
+        case = self._case(conn, case_id)
+        start = self._clock_start(conn, case_id)
+        if start is None:
+            return False
+        current = parse_time(case["clock_start_at"]) if case["clock_start_at"] else None
+        if current is not None and current <= start:
+            return False
+        due = report_deadline(start, bool(case["serious"]), bool(case["fatal"]))
+        conn.execute("UPDATE cases SET clock_start_at=?,report_due_at=?,updated_at=? WHERE id=?",
+                     (iso(start), iso(due), iso(), case_id))
+        Repository.audit(conn, case_id, actor, role, "clock_start_recomputed", {
+            "reason": reason, "previous_clock_start_at": case["clock_start_at"], "clock_start_at": iso(start)})
+        self._sync_report_deadlines(conn, dict(self._case(conn, case_id)), actor, role, reason, correct_submitted=True)
+        return True
+
+    # ---- 案例与来源接入 ----
+
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
         missing = [key for key in required if not str(body.get(key, "")).strip()]
@@ -198,38 +325,89 @@ class PharmacovigilanceService:
             raise ApiError(403, "region_forbidden", "只能录入本区域案例")
         if role == "medical_reviewer" and body["region"] not in {"", region}:
             raise ApiError(403, "reviewer_region_forbidden", "医学审核员不能代表区域录入案例")
-        received = parse_time(body.get("received_at"), utcnow())
+        received, aware = source_times(body)
         serious = bool(body.get("serious", False))
         fatal = bool(body.get("fatal", False))
-        due = report_deadline(received, serious, fatal)
         now = iso()
         with self.repo.tx() as conn:
             duplicate = conn.execute("SELECT * FROM intakes WHERE dedupe_key=?", (body["dedupe_key"],)).fetchone()
             if duplicate:
+                # 重复录入不丢弃：挂到原案例作为重复来源，最早知情时间生效
                 case = self._case(conn, duplicate["case_id"])
-                Repository.audit(conn, case["id"], actor, role, "intake_deduplicated", {"dedupe_key": body["dedupe_key"], "source": body["source"]})
-                return {"deduplicated": True, "case": dict(case), "intake_id": duplicate["id"]}
+                if case["status"] == "merged" and case["merged_into"]:
+                    case = self._case(conn, case["merged_into"])
+                if not self.can_access(case, role, region):
+                    raise ApiError(403, "region_forbidden", "无权为该区域案例补录来源")
+                suffix = conn.execute(
+                    "SELECT COUNT(*) FROM intakes WHERE case_id=? AND kind='duplicate'", (case["id"],)).fetchone()[0] + 1
+                cursor = conn.execute(
+                    """INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,aware_at,kind,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (case["id"], body["source"], f'{body["dedupe_key"]}#dup{suffix}',
+                     json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), iso(aware), "duplicate", actor, now),
+                )
+                clock_updated = self._refresh_clock(conn, case["id"], actor, role, "duplicate_source")
+                Repository.audit(conn, case["id"], actor, role, "intake_deduplicated", {
+                    "dedupe_key": body["dedupe_key"], "source": body["source"],
+                    "attached_as": "duplicate", "clock_updated": clock_updated})
+                return {"deduplicated": True, "case": dict(self._case(conn, case["id"])), "intake_id": cursor.lastrowid}
+            due = report_deadline(aware, serious, fatal)
             count = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0] + 1
             case_no = body.get("case_no") or f"PV-{received.year}-{count:06d}"
             try:
                 cursor = conn.execute(
-                    """INSERT INTO cases(case_no,patient_ref,region,product,event_term,onset_at,received_at,
+                    """INSERT INTO cases(case_no,patient_ref,region,product,event_term,onset_at,received_at,clock_start_at,
                        serious,fatal,causality,report_due_at,status,revision,created_by,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (case_no, body["patient_ref"], body["region"], body["product"], body["event_term"],
-                     body.get("onset_at"), iso(received), int(serious), int(fatal), body.get("causality"),
+                     body.get("onset_at"), iso(received), iso(aware), int(serious), int(fatal), body.get("causality"),
                      iso(due), "open", 1, actor, now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "case_number_conflict", "案例编号已存在") from exc
             case_id = cursor.lastrowid
             conn.execute(
-                "INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (case_id, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), actor, now),
+                """INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,aware_at,kind,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (case_id, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True),
+                 iso(received), iso(aware), "initial", actor, now),
             )
-            Repository.audit(conn, case_id, actor, role, "case_created", {"case_no": case_no, "source": body["source"]})
+            Repository.audit(conn, case_id, actor, role, "case_created",
+                             {"case_no": case_no, "source": body["source"], "aware_at": iso(aware)})
             case = self._case(conn, case_id)
             return {"deduplicated": False, "case": dict(case)}
+
+    def add_source(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        """来源补录：记录来源知情时间，最早时间成为时限基准；越权补录直接拒绝。"""
+        if role == "medical_reviewer":
+            raise ApiError(403, "source_forbidden", "医学审核员不能补录来源")
+        source = str(body.get("source", "")).strip()
+        dedupe_key = str(body.get("dedupe_key", "")).strip()
+        if not source or not dedupe_key:
+            raise ApiError(400, "missing_fields", "source 和 dedupe_key 必填")
+        received, aware = source_times(body)
+        with self.repo.tx() as conn:
+            case = self._case(conn, case_id)
+            if not self.can_access(case, role, region):
+                raise ApiError(403, "source_forbidden", "无权为该区域案例补录来源")
+            if case["status"] == "merged":
+                raise ApiError(409, "case_merged", "已合并案例不能再补录来源")
+            existing = conn.execute("SELECT * FROM intakes WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+            if existing:
+                if existing["case_id"] != case_id:
+                    raise ApiError(409, "dedupe_key_conflict", "该来源已记录在其他案例上")
+                return {"intake": dict(existing), "case": dict(case), "deduplicated": True, "clock_updated": False}
+            cursor = conn.execute(
+                """INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,aware_at,kind,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (case_id, source, dedupe_key, json.dumps(body, ensure_ascii=False, sort_keys=True),
+                 iso(received), iso(aware), "supplement", actor, iso()),
+            )
+            clock_updated = self._refresh_clock(conn, case_id, actor, role, "source_supplemented")
+            Repository.audit(conn, case_id, actor, role, "source_supplemented", {
+                "intake_id": cursor.lastrowid, "source": source, "aware_at": iso(aware), "clock_updated": clock_updated})
+            return {"intake": dict(conn.execute("SELECT * FROM intakes WHERE id=?", (cursor.lastrowid,)).fetchone()),
+                    "case": dict(self._case(conn, case_id)), "deduplicated": False, "clock_updated": clock_updated}
 
     def get_case(self, case_id: int, role: str, region: str) -> dict[str, Any]:
         case = self._case(self.repo.conn, case_id)
@@ -238,7 +416,9 @@ class PharmacovigilanceService:
         conn = self.repo.conn
         return {
             "case": dict(case),
-            "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
+            "intakes": [dict(r) for r in conn.execute(
+                "SELECT id,source,dedupe_key,kind,received_at,aware_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id",
+                (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
@@ -265,6 +445,7 @@ class PharmacovigilanceService:
         expected = body.get("expected_revision")
         if not isinstance(expected, int):
             raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        received, aware = source_times(body)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region) or role in {"medical_reviewer"}:
@@ -274,17 +455,17 @@ class PharmacovigilanceService:
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
-            received = parse_time(body.get("received_at"), utcnow())
-            due = report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
             conn.execute(
-                "INSERT INTO followups(case_id,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (case_id, content, source, iso(received), revision, actor, iso()),
+                "INSERT INTO followups(case_id,content,source,received_at,aware_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (case_id, content, source, iso(received), iso(aware), revision, actor, iso()),
             )
             conn.execute(
-                "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
-                (revision, iso(received), iso(due), iso(), case_id),
+                "UPDATE cases SET revision=?,received_at=?,updated_at=? WHERE id=?",
+                (revision, iso(received), iso(), case_id),
             )
-            Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
+            clock_updated = self._refresh_clock(conn, case_id, actor, role, "followup_source")
+            Repository.audit(conn, case_id, actor, role, "followup_added", {
+                "revision": revision, "source": source, "aware_at": iso(aware), "clock_updated": clock_updated})
             return {"case": dict(self._case(conn, case_id)), "revision": revision}
 
     def medical_review(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -301,8 +482,6 @@ class PharmacovigilanceService:
             raise ApiError(400, "invalid_review", "serious/fatal 必须是布尔值，causality 和 rationale 必填")
         if fatal and not serious:
             raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
-        received = parse_time(body.get("received_at"))
-        due = report_deadline(received, serious, fatal)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if case["status"] == "merged":
@@ -310,6 +489,8 @@ class PharmacovigilanceService:
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
             revision = expected + 1
+            start = parse_time(case["clock_start_at"] or case["received_at"])
+            due = report_deadline(start, serious, fatal)
             conn.execute(
                 """UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=?,revision=?,updated_at=? WHERE id=?""",
                 (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
@@ -319,6 +500,8 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
+            self._sync_report_deadlines(conn, dict(self._case(conn, case_id)), actor, role,
+                                        "seriousness_changed", correct_submitted=False)
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
 
@@ -332,7 +515,8 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
-            due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
+            start = parse_time(case["clock_start_at"] or case["received_at"])
+            due = report_deadline(start, bool(case["serious"]), bool(case["fatal"]))
             try:
                 cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
             except sqlite3.IntegrityError as exc:
@@ -351,11 +535,30 @@ class PharmacovigilanceService:
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
+            if row["status"] == "correction_required":
+                raise ApiError(409, "correction_unconfirmed", "报告已转待更正，需医学审核员确认后才能重报")
             now = parse_time(body.get("submitted_at"), utcnow())
             late = int(now > parse_time(row["due_at"]))
             conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
             Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
+
+    def confirm_report_correction(self, report_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """医学审核员确认待更正报告，确认后才允许重报。"""
+        if role != "medical_reviewer":
+            raise ApiError(403, "medical_reviewer_required", "只有医学审核员可以确认更正")
+        note = str(body.get("note", "")).strip()
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "report_not_found", "报告不存在")
+            if row["status"] != "correction_required":
+                raise ApiError(409, "no_correction_pending", "该报告不在待更正状态")
+            conn.execute("UPDATE reports SET status='pending',confirmed_by=?,confirmed_at=? WHERE id=?",
+                         (actor, iso(), report_id))
+            Repository.audit(conn, row["case_id"], actor, role, "report_correction_confirmed",
+                             {"report_id": report_id, "country": row["country"], "note": note})
+            return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone())}
 
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
@@ -372,16 +575,26 @@ class PharmacovigilanceService:
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
+            self._refresh_clock(conn, target_id, actor, role, "case_merged")
             Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
             Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
             return {"case": dict(self._case(conn, source_id)), "idempotent": False}
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
+        sql = "SELECT * FROM reports WHERE status IN ('pending','overdue') AND due_at < ?"
         args: list[Any] = [iso()]
         if role not in {"medical_reviewer", "global_admin"}:
             sql += " AND case_id IN (SELECT id FROM cases WHERE region=?)"
             args.append(region)
+        return [dict(r) for r in self.repo.conn.execute(sql, args)]
+
+    def corrections(self, role: str, region: str) -> list[dict[str, Any]]:
+        sql = "SELECT r.* FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.status='correction_required'"
+        args: list[Any] = []
+        if role not in {"medical_reviewer", "global_admin"}:
+            sql += " AND c.region=?"
+            args.append(region)
+        sql += " ORDER BY r.due_at"
         return [dict(r) for r in self.repo.conn.execute(sql, args)]
 
     def escalate_overdue(self, actor: str, role: str, region: str) -> dict[str, Any]:
@@ -396,7 +609,8 @@ class PharmacovigilanceService:
 
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        return {"cases": cases, "overdue": self.overdue(role, region),
+                "corrections": self.corrections(role, region), "server_time": iso()}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -437,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/corrections":
+            return 200, {"reports": self.service.corrections(role, region)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
@@ -451,6 +667,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             case_id, action = int(parts[2]), parts[3]
+            if action == "sources":
+                return 201, self.service.add_source(case_id, actor, role, region, body)
             if action == "followups":
                 return 201, self.service.add_followup(case_id, actor, role, region, body)
             if action == "medical-review":
@@ -459,8 +677,12 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_report(case_id, actor, role, region, body)
             if action == "merge":
                 return 200, self.service.merge_cases(case_id, actor, role, body)
-        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
-            return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit():
+            report_id, action = int(parts[2]), parts[3]
+            if action == "submit":
+                return 200, self.service.submit_report(report_id, actor, role, region, body)
+            if action == "confirm":
+                return 200, self.service.confirm_report_correction(report_id, actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:
